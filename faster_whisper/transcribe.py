@@ -19,6 +19,8 @@ from faster_whisper.vad import (
     collect_chunks,
     get_speech_timestamps,
 )
+import tritonclient.grpc.aio
+from tritonclient.utils import np_to_triton_dtype
 
 
 class Word(NamedTuple):
@@ -76,6 +78,7 @@ class WhisperModel:
     def __init__(
         self,
         model_size_or_path: str,
+        triton_server_url: str,
         device: str = "auto",
         device_index: Union[int, List[int]] = 0,
         compute_type: str = "default",
@@ -110,32 +113,12 @@ class WhisperModel:
             local cached file if it exists.
         """
         self.logger = get_logger()
-
-        if os.path.isdir(model_size_or_path):
-            model_path = model_size_or_path
-        else:
-            model_path = download_model(
-                model_size_or_path,
-                local_files_only=local_files_only,
-                cache_dir=download_root,
-            )
-
-        self.model = ctranslate2.models.Whisper(
-            model_path,
-            device=device,
-            device_index=device_index,
-            compute_type=compute_type,
-            intra_threads=cpu_threads,
-            inter_threads=num_workers,
+        # print("Initializing Whisper model")
+        self.model = None
+        self.triton_server_url = triton_server_url
+        self.hf_tokenizer = tokenizers.Tokenizer.from_pretrained(
+            "openai/whisper-tiny" + ("" if True else ".en")
         )
-
-        tokenizer_file = os.path.join(model_path, "tokenizer.json")
-        if os.path.isfile(tokenizer_file):
-            self.hf_tokenizer = tokenizers.Tokenizer.from_file(tokenizer_file)
-        else:
-            self.hf_tokenizer = tokenizers.Tokenizer.from_pretrained(
-                "openai/whisper-tiny" + ("" if self.model.is_multilingual else ".en")
-            )
 
         self.feature_extractor = FeatureExtractor()
         self.num_samples_per_token = self.feature_extractor.hop_length * 2
@@ -152,7 +135,7 @@ class WhisperModel:
     def transcribe(
         self,
         audio: Union[str, BinaryIO, np.ndarray],
-        language: Optional[str] = None,
+        language: str = "en",
         task: str = "transcribe",
         beam_size: int = 5,
         best_of: int = 5,
@@ -239,7 +222,7 @@ class WhisperModel:
             audio = decode_audio(audio, sampling_rate=sampling_rate)
 
         duration = audio.shape[0] / sampling_rate
-
+        # print(duration)
         self.logger.info(
             "Processing audio with duration %s", format_timestamp(duration)
         )
@@ -251,7 +234,7 @@ class WhisperModel:
                 vad_parameters = VadOptions(**vad_parameters)
             speech_chunks = get_speech_timestamps(audio, vad_parameters)
             audio = collect_chunks(audio, speech_chunks)
-
+            # print("VAD")
             self.logger.info(
                 "VAD filter removed %s of audio",
                 format_timestamp(duration - (audio.shape[0] / sampling_rate)),
@@ -272,38 +255,14 @@ class WhisperModel:
 
         else:
             speech_chunks = None
-
+        # print(audio.shape)
         features = self.feature_extractor(audio)
 
         encoder_output = None
-        all_language_probs = None
-
-        if language is None:
-            if not self.model.is_multilingual:
-                language = "en"
-                language_probability = 1
-            else:
-                segment = features[:, : self.feature_extractor.nb_max_frames]
-                encoder_output = self.encode(segment)
-                # results is a list of tuple[str, float] with language names and
-                # probabilities.
-                results = self.model.detect_language(encoder_output)[0]
-                # Parse language names to strip out markers
-                all_language_probs = [(token[2:-2], prob) for (token, prob) in results]
-                # Get top language token and probability
-                language, language_probability = all_language_probs[0]
-
-                self.logger.info(
-                    "Detected language '%s' with probability %.2f",
-                    language,
-                    language_probability,
-                )
-        else:
-            language_probability = 1
 
         tokenizer = Tokenizer(
             self.hf_tokenizer,
-            self.model.is_multilingual,
+            True,
             task=task,
             language=language,
         )
@@ -330,19 +289,19 @@ class WhisperModel:
             prepend_punctuations=prepend_punctuations,
             append_punctuations=append_punctuations,
         )
-
+        # print(options)
         segments = self.generate_segments(features, tokenizer, options, encoder_output)
-
+        # print(segments)
         if speech_chunks:
             segments = restore_speech_timestamps(segments, speech_chunks, sampling_rate)
 
         info = TranscriptionInfo(
             language=language,
-            language_probability=language_probability,
+            language_probability=1,
             duration=duration,
             transcription_options=options,
             vad_options=vad_parameters,
-            all_language_probs=all_language_probs,
+            all_language_probs=None,
         )
 
         return segments, info
@@ -355,6 +314,7 @@ class WhisperModel:
         encoder_output: Optional[ctranslate2.StorageView] = None,
     ) -> Iterable[Segment]:
         content_frames = features.shape[-1] - self.feature_extractor.nb_max_frames
+        # print(content_frames)
         idx = 0
         seek = 0
         all_tokens = []
@@ -385,44 +345,40 @@ class WhisperModel:
                 without_timestamps=options.without_timestamps,
                 prefix=options.prefix if seek == 0 else None,
             )
+            # print(prompt)
 
-            if encoder_output is None:
-                encoder_output = self.encode(segment)
-
+            # print(segment.shape)
             (
-                result,
-                avg_logprob,
-                temperature,
-                compression_ratio,
-            ) = self.generate_with_fallback(encoder_output, prompt, tokenizer, options)
+                result
+            ) = self.generate_with_fallback(segment, prompt, tokenizer, options)
 
-            if options.no_speech_threshold is not None:
-                # no voice activity check
-                should_skip = result.no_speech_prob > options.no_speech_threshold
+            # if options.no_speech_threshold is not None:
+            #     # no voice activity check
+            #     should_skip = result.no_speech_prob > options.no_speech_threshold
 
-                if (
-                    options.log_prob_threshold is not None
-                    and avg_logprob > options.log_prob_threshold
-                ):
-                    # don't skip if the logprob is high enough, despite the no_speech_prob
-                    should_skip = False
+            #     if (
+            #         options.log_prob_threshold is not None
+            #         and avg_logprob > options.log_prob_threshold
+            #     ):
+            #         # don't skip if the logprob is high enough, despite the no_speech_prob
+            #         should_skip = False
 
-                if should_skip:
-                    self.logger.debug(
-                        "No speech threshold is met (%f > %f)",
-                        result.no_speech_prob,
-                        options.no_speech_threshold,
-                    )
+            #     if should_skip:
+            #         self.logger.debug(
+            #             "No speech threshold is met (%f > %f)",
+            #             result.no_speech_prob,
+            #             options.no_speech_threshold,
+            #         )
 
-                    # fast-forward to the next segment boundary
-                    seek += segment_size
-                    continue
+            # # fast-forward to the next segment boundary
+            # seek += segment_size
+            # continue
 
-            tokens = result.sequences_ids[0]
+            tokens = result
 
             previous_seek = seek
             current_segments = []
-
+            # print(tokens)
             single_timestamp_ending = (
                 len(tokens) >= 2
                 and tokens[-2] < tokenizer.timestamp_begin
@@ -436,7 +392,7 @@ class WhisperModel:
                 and tokens[i] >= tokenizer.timestamp_begin
                 and tokens[i - 1] >= tokenizer.timestamp_begin
             ]
-
+            # print(consecutive_timestamps)
             if len(consecutive_timestamps) > 0:
                 slices = list(consecutive_timestamps)
                 if single_timestamp_ending:
@@ -479,6 +435,8 @@ class WhisperModel:
                     seek += last_timestamp_position * self.input_stride
 
             else:
+                tokens = tokens.tolist()[0]
+                # print(tokens)
                 duration = segment_duration
                 timestamps = [
                     token for token in tokens if token >= tokenizer.timestamp_begin
@@ -521,7 +479,7 @@ class WhisperModel:
                         seek = previous_seek + seek_shift
 
             encoder_output = None
-
+            # print(current_segments)
             for segment in current_segments:
                 tokens = segment["tokens"]
                 text = tokenizer.decode(tokens)
@@ -539,10 +497,10 @@ class WhisperModel:
                     end=segment["end"],
                     text=text,
                     tokens=tokens,
-                    temperature=temperature,
-                    avg_logprob=avg_logprob,
-                    compression_ratio=compression_ratio,
-                    no_speech_prob=result.no_speech_prob,
+                    temperature=0,
+                    avg_logprob=0,
+                    compression_ratio=0,
+                    no_speech_prob=0,
                     words=(
                         [Word(**word) for word in segment["words"]]
                         if options.word_timestamps
@@ -550,8 +508,8 @@ class WhisperModel:
                     ),
                 )
 
-            if not options.condition_on_previous_text or temperature > 0.5:
-                prompt_reset_since = len(all_tokens)
+            # if not options.condition_on_previous_text or 0 > 0.5:
+            #     prompt_reset_since = len(all_tokens)
 
     def encode(self, features: np.ndarray) -> ctranslate2.StorageView:
         # When the model is running on multiple GPUs, the encoder output should be moved
@@ -565,7 +523,7 @@ class WhisperModel:
 
     def generate_with_fallback(
         self,
-        encoder_output: ctranslate2.StorageView,
+        features: np.ndarray,
         prompt: List[int],
         tokenizer: Tokenizer,
         options: TranscriptionOptions,
@@ -594,61 +552,89 @@ class WhisperModel:
                 }
 
             final_temperature = temperature
-            result = self.model.generate(
-                encoder_output,
-                [prompt],
-                length_penalty=options.length_penalty,
-                max_length=self.max_length,
-                return_scores=True,
-                return_no_speech_prob=True,
-                suppress_blank=options.suppress_blank,
-                suppress_tokens=options.suppress_tokens,
-                max_initial_timestamp_index=max_initial_timestamp_index,
-                **kwargs,
-            )[0]
+            # result = self.model.generate(
+            #     encoder_output,
+            #     [prompt],
+            #     length_penalty=options.length_penalty,
+            #     max_length=self.max_length,
+            #     return_scores=True,
+            #     return_no_speech_prob=True,
+            #     suppress_blank=options.suppress_blank,
+            #     suppress_tokens=options.suppress_tokens,
+            #     max_initial_timestamp_index=max_initial_timestamp_index,
+            #     **kwargs,
+            # )[0]
+            result = self.triton_encode(features, prompt)
 
-            tokens = result.sequences_ids[0]
+            tokens = result[0]
 
             # Recover the average log prob from the returned score.
             seq_len = len(tokens)
-            cum_logprob = result.scores[0] * (seq_len**options.length_penalty)
-            avg_logprob = cum_logprob / (seq_len + 1)
 
             text = tokenizer.decode(tokens).strip()
             compression_ratio = get_compression_ratio(text)
 
             needs_fallback = False
 
-            if (
-                options.compression_ratio_threshold is not None
-                and compression_ratio > options.compression_ratio_threshold
-            ):
-                needs_fallback = True  # too repetitive
+            # if (
+            #     options.compression_ratio_threshold is not None
+            #     and compression_ratio > options.compression_ratio_threshold
+            # ):
+            #     needs_fallback = True  # too repetitive
 
-                self.logger.debug(
-                    "Compression ratio threshold is not met with temperature %.1f (%f > %f)",
-                    temperature,
-                    compression_ratio,
-                    options.compression_ratio_threshold,
-                )
+            #     self.logger.debug(
+            #         "Compression ratio threshold is not met with temperature %.1f (%f > %f)",
+            #         temperature,
+            #         compression_ratio,
+            #         options.compression_ratio_threshold,
+            #     )
 
-            if (
-                options.log_prob_threshold is not None
-                and avg_logprob < options.log_prob_threshold
-            ):
-                needs_fallback = True  # average log probability is too low
+            # if (
+            #     options.log_prob_threshold is not None
+            #     and avg_logprob < options.log_prob_threshold
+            # ):
+            #     needs_fallback = True  # average log probability is too low
 
-                self.logger.debug(
-                    "Log probability threshold is not met with temperature %.1f (%f < %f)",
-                    temperature,
-                    avg_logprob,
-                    options.log_prob_threshold,
-                )
+            #     self.logger.debug(
+            #         "Log probability threshold is not met with temperature %.1f (%f < %f)",
+            #         temperature,
+            #         avg_logprob,
+            #         options.log_prob_threshold,
+            #     )
 
             if not needs_fallback:
                 break
 
-        return result, avg_logprob, final_temperature, compression_ratio
+        return result
+
+    def triton_encode(self, features: np.ndarray, prompt: List[int]):
+
+        # # print("triton encode")
+        # # print(features)
+        # # print(prompt)
+        MODEL_NAME = "whisper"
+        URL = self.triton_server_url
+        client = tritonclient.grpc.InferenceServerClient(URL)
+        prompt = np.array([prompt,], dtype=np.int32)
+        # merge all the features into one array
+        features = np.concatenate(features, axis=0)
+        # print(features)
+        features = features.reshape(1, -1).astype(np.float32)
+        # print(features.shape)
+        inputs = [
+            tritonclient.grpc.InferInput("FEATURES", features.shape,
+                                         np_to_triton_dtype(np.float32)),
+            tritonclient.grpc.InferInput("PROMPTS_IDS", prompt.shape,
+                                         np_to_triton_dtype(prompt.dtype)),
+        ]
+        inputs[0].set_data_from_numpy(features)
+        inputs[1].set_data_from_numpy(prompt)
+        outputs = [tritonclient.grpc.InferRequestedOutput("OUTPUT_IDS")]
+
+        res = client.infer(model_name=MODEL_NAME, inputs=inputs, outputs=outputs)
+        results = res.as_numpy("OUTPUT_IDS")
+        # print(results)
+        return results
 
     def get_prompt(
         self,
@@ -675,130 +661,6 @@ class WhisperModel:
             prompt.extend(prefix_tokens)
 
         return prompt
-
-    def add_word_timestamps(
-        self,
-        segments: List[dict],
-        tokenizer: Tokenizer,
-        encoder_output: ctranslate2.StorageView,
-        num_frames: int,
-        prepend_punctuations: str,
-        append_punctuations: str,
-    ):
-        if len(segments) == 0:
-            return
-
-        text_tokens_per_segment = [
-            [token for token in segment["tokens"] if token < tokenizer.eot]
-            for segment in segments
-        ]
-
-        text_tokens = list(itertools.chain.from_iterable(text_tokens_per_segment))
-        alignment = self.find_alignment(
-            tokenizer, text_tokens, encoder_output, num_frames
-        )
-        merge_punctuations(alignment, prepend_punctuations, append_punctuations)
-
-        time_offset = (
-            segments[0]["seek"]
-            * self.feature_extractor.hop_length
-            / self.feature_extractor.sampling_rate
-        )
-
-        word_index = 0
-
-        for segment, text_tokens in zip(segments, text_tokens_per_segment):
-            saved_tokens = 0
-            words = []
-
-            while word_index < len(alignment) and saved_tokens < len(text_tokens):
-                timing = alignment[word_index]
-
-                if timing["word"]:
-                    words.append(
-                        dict(
-                            word=timing["word"],
-                            start=round(time_offset + timing["start"], 2),
-                            end=round(time_offset + timing["end"], 2),
-                            probability=timing["probability"],
-                        )
-                    )
-
-                saved_tokens += len(timing["tokens"])
-                word_index += 1
-
-            if len(words) > 0:
-                # adjust the segment-level timestamps based on the word-level timestamps
-                segment["start"] = words[0]["start"]
-                segment["end"] = words[-1]["end"]
-
-            segment["words"] = words
-
-    def find_alignment(
-        self,
-        tokenizer: Tokenizer,
-        text_tokens: List[int],
-        encoder_output: ctranslate2.StorageView,
-        num_frames: int,
-        median_filter_width: int = 7,
-    ) -> List[dict]:
-        if len(text_tokens) == 0:
-            return []
-
-        result = self.model.align(
-            encoder_output,
-            tokenizer.sot_sequence,
-            [text_tokens],
-            num_frames,
-            median_filter_width=median_filter_width,
-        )[0]
-
-        text_token_probs = result.text_token_probs
-
-        alignments = result.alignments
-        text_indices = np.array([pair[0] for pair in alignments])
-        time_indices = np.array([pair[1] for pair in alignments])
-
-        words, word_tokens = tokenizer.split_to_word_tokens(
-            text_tokens + [tokenizer.eot]
-        )
-        word_boundaries = np.pad(np.cumsum([len(t) for t in word_tokens[:-1]]), (1, 0))
-        if len(word_boundaries) <= 1:
-            return []
-
-        jumps = np.pad(np.diff(text_indices), (1, 0), constant_values=1).astype(bool)
-        jump_times = time_indices[jumps] / self.tokens_per_second
-        start_times = jump_times[word_boundaries[:-1]]
-        end_times = jump_times[word_boundaries[1:]]
-        word_probabilities = [
-            np.mean(text_token_probs[i:j])
-            for i, j in zip(word_boundaries[:-1], word_boundaries[1:])
-        ]
-
-        # hack: ensure the first and second word is not longer than twice the median word duration.
-        # a better segmentation algorithm based on VAD should be able to replace this.
-        word_durations = end_times - start_times
-        word_durations = word_durations[word_durations.nonzero()]
-        if len(word_durations) > 0:
-            median_duration = np.median(word_durations)
-            max_duration = median_duration * 2
-            if len(word_durations) >= 2 and word_durations[1] > max_duration:
-                boundary = max(end_times[2] / 2, end_times[2] - max_duration)
-                end_times[0] = start_times[1] = boundary
-            if (
-                len(word_durations) >= 1
-                and end_times[0] - start_times[0] > max_duration
-            ):
-                start_times[0] = max(0, end_times[0] - max_duration)
-
-        return [
-            dict(
-                word=word, tokens=tokens, start=start, end=end, probability=probability
-            )
-            for word, tokens, start, end, probability in zip(
-                words, word_tokens, start_times, end_times, word_probabilities
-            )
-        ]
 
 
 def restore_speech_timestamps(
