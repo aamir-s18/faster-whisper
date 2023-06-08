@@ -19,6 +19,7 @@ from faster_whisper.vad import (
     collect_chunks,
     get_speech_timestamps,
 )
+from tritonclient.grpc.aio import InferenceServerClient
 import tritonclient.grpc.aio
 from tritonclient.utils import np_to_triton_dtype
 
@@ -132,7 +133,7 @@ class WhisperModel:
         self.time_precision = 0.02
         self.max_length = 448
 
-    def transcribe(
+    async def transcribe(
         self,
         audio: Union[str, BinaryIO, np.ndarray],
         language: str = "en",
@@ -293,7 +294,7 @@ class WhisperModel:
         segments = self.generate_segments(features, tokenizer, options, encoder_output)
         # print(segments)
         if speech_chunks:
-            segments = restore_speech_timestamps(segments, speech_chunks, sampling_rate)
+            segments = await restore_speech_timestamps(segments, speech_chunks, sampling_rate)
 
         info = TranscriptionInfo(
             language=language,
@@ -306,7 +307,7 @@ class WhisperModel:
 
         return segments, info
 
-    def generate_segments(
+    async def generate_segments(
         self,
         features: np.ndarray,
         tokenizer: Tokenizer,
@@ -350,7 +351,7 @@ class WhisperModel:
             # print(segment.shape)
             (
                 result
-            ) = self.generate_with_fallback(segment, prompt, tokenizer, options)
+            ) = await self.generate_with_fallback(segment, prompt, tokenizer, options)
 
             # if options.no_speech_threshold is not None:
             #     # no voice activity check
@@ -521,7 +522,7 @@ class WhisperModel:
 
         return self.model.encode(features, to_cpu=to_cpu)
 
-    def generate_with_fallback(
+    async def generate_with_fallback(
         self,
         features: np.ndarray,
         prompt: List[int],
@@ -564,7 +565,7 @@ class WhisperModel:
             #     max_initial_timestamp_index=max_initial_timestamp_index,
             #     **kwargs,
             # )[0]
-            result = self.triton_encode(features, prompt)
+            result = await self.triton_encode(features, prompt)
 
             tokens = result[0]
 
@@ -607,14 +608,14 @@ class WhisperModel:
 
         return result
 
-    def triton_encode(self, features: np.ndarray, prompt: List[int]):
+    async def triton_encode(self, features: np.ndarray, prompt: List[int]):
 
         # # print("triton encode")
         # # print(features)
         # # print(prompt)
         MODEL_NAME = "whisper"
         URL = self.triton_server_url
-        client = tritonclient.grpc.InferenceServerClient(URL)
+        client = InferenceServerClient(URL)
         prompt = np.array([prompt,], dtype=np.int32)
         # merge all the features into one array
         features = np.concatenate(features, axis=0)
@@ -631,7 +632,7 @@ class WhisperModel:
         inputs[1].set_data_from_numpy(prompt)
         outputs = [tritonclient.grpc.InferRequestedOutput("OUTPUT_IDS")]
 
-        res = client.infer(model_name=MODEL_NAME, inputs=inputs, outputs=outputs)
+        res = await client.infer(model_name=MODEL_NAME, inputs=inputs, outputs=outputs)
         results = res.as_numpy("OUTPUT_IDS")
         # print(results)
         return results
@@ -663,14 +664,14 @@ class WhisperModel:
         return prompt
 
 
-def restore_speech_timestamps(
+async def restore_speech_timestamps(
     segments: Iterable[Segment],
     speech_chunks: List[dict],
     sampling_rate: int,
 ) -> Iterable[Segment]:
     ts_map = SpeechTimestampsMap(speech_chunks, sampling_rate)
 
-    for segment in segments:
+    async for segment in segments:
         if segment.words:
             words = []
             for word in segment.words:
